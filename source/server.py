@@ -1,4 +1,4 @@
-"""Task server: worker registration, scheduling, timeouts and recovery."""
+"""Task server: concurrent clients, worker scheduling, timeouts and recovery."""
 import argparse
 import json
 import os
@@ -7,14 +7,13 @@ import threading
 import time
 import uuid
 from collections import deque
-from common import messages, send
 
-WORKER_IPS = {'10.0.0.2', '10.0.0.3'}
-LOAD_FILE = '/tmp/sdn_worker_load.json'
-CAPACITY = 2                 # at most 2 outstanding tasks per worker
-TASK_TIMEOUT = 16            # Allows two sequential 5-second tasks plus overhead
-HEARTBEAT_TIMEOUT = 8
-MAX_ATTEMPTS = 3
+from common import messages, send
+from config import (
+    SERVER_PORT, WORKER_IPS, LOAD_FILE, WORKER_CAPACITY,
+    TASK_TIMEOUT, HEARTBEAT_TIMEOUT, MAX_ATTEMPTS,
+    MAX_BATCH_SIZE, MAX_ABS_NUMBER, MAX_TASK_DELAY,
+)
 
 lock = threading.RLock()
 workers = {}                 # IP -> connection and assigned task IDs
@@ -54,7 +53,9 @@ def remove_worker(ip, worker, reason):
             continue
         task['worker'] = None
         if task['attempt'] >= MAX_ATTEMPTS:
-            reply(task, {'type': 'error', 'id': task_id, 'error': 'retry limit reached'})
+            reply(task, {
+                'type': 'error', 'id': task_id, 'error': 'retry limit reached'
+            })
             del tasks[task_id]
         else:
             pending.appendleft(task_id)
@@ -70,8 +71,11 @@ def remove_worker(ip, worker, reason):
 def dispatch():
     # Called while holding lock. Choose the least busy worker.
     while pending:
-        available = [(len(w['jobs']), ip, w) for ip, w in workers.items()
-                     if len(w['jobs']) < CAPACITY]
+        available = [
+            (len(w['jobs']), ip, w)
+            for ip, w in workers.items()
+            if len(w['jobs']) < WORKER_CAPACITY
+        ]
         if not available:
             return
         _, ip, worker = min(available, key=lambda item: (item[0], item[1]))
@@ -85,10 +89,13 @@ def dispatch():
         worker['jobs'].add(task_id)
         publish_load()
         try:
-            send(worker['socket'], {'type': 'task', 'id': task_id,
-                 'attempt': task['attempt'], 'number': task['number'],
-                 'delay': task['delay']}, worker['send_lock'])
-            print('Assigned', task_id, 'to', ip, 'attempt', task['attempt'], flush=True)
+            send(worker['socket'], {
+                'type': 'task', 'id': task_id,
+                'attempt': task['attempt'], 'number': task['number'],
+                'delay': task['delay'],
+            }, worker['send_lock'])
+            print('Assigned', task_id, 'to', ip,
+                  'attempt', task['attempt'], flush=True)
         except OSError:
             remove_worker(ip, worker, 'send failed')
 
@@ -97,8 +104,12 @@ def handle_worker(sock, ip, stream):
     if ip not in WORKER_IPS:
         print('Rejected worker from', ip, flush=True)
         return
-    worker = {'socket': sock, 'send_lock': threading.Lock(), 'jobs': set(),
-              'last_seen': time.monotonic()}
+    worker = {
+        'socket': sock,
+        'send_lock': threading.Lock(),
+        'jobs': set(),
+        'last_seen': time.monotonic(),
+    }
     with lock:
         if ip in workers:
             remove_worker(ip, workers[ip], 'replaced by new connection')
@@ -106,6 +117,7 @@ def handle_worker(sock, ip, stream):
         publish_load()
         print('Registered worker', ip, flush=True)
         dispatch()
+
     try:
         for msg in stream:
             with lock:
@@ -116,13 +128,16 @@ def handle_worker(sock, ip, stream):
                     continue
                 task_id = msg.get('id')
                 task = tasks.get(task_id)
-                if not task or task['worker'] != ip or task['attempt'] != msg.get('attempt'):
+                if (not task or task['worker'] != ip or
+                        task['attempt'] != msg.get('attempt')):
                     continue  # late result from an obsolete attempt
                 worker['jobs'].discard(task_id)
                 publish_load()
-                reply(task, {'type': 'result', 'id': task_id, 'number': task['number'],
-                             'result': msg.get('result'), 'worker': ip,
-                             'attempts': task['attempt']})
+                reply(task, {
+                    'type': 'result', 'id': task_id,
+                    'number': task['number'], 'result': msg.get('result'),
+                    'worker': ip, 'attempts': task['attempt'],
+                })
                 del tasks[task_id]
                 print('Completed', task_id, 'by', ip, flush=True)
                 dispatch()
@@ -135,21 +150,28 @@ def handle_worker(sock, ip, stream):
 def handle_client(sock, first):
     numbers = first.get('numbers')
     delay = first.get('delay')
-    if (not isinstance(numbers, list) or not 1 <= len(numbers) <= 100 or
-        any(type(n) is not int or abs(n) > 1000000 for n in numbers) or
-        type(delay) not in (int, float) or not 0 <= delay <= 5):
+    if (
+        not isinstance(numbers, list) or
+        not 1 <= len(numbers) <= MAX_BATCH_SIZE or
+        any(type(n) is not int or abs(n) > MAX_ABS_NUMBER for n in numbers) or
+        type(delay) not in (int, float) or not 0 <= delay <= MAX_TASK_DELAY
+    ):
         send(sock, {'type': 'error', 'error': 'Invalid batch'}, threading.Lock())
         return
+
     client_lock = threading.Lock()
-    ids = [uuid.uuid4().hex[:12] for _ in numbers]
+    ids = [uuid.uuid4().hex for _ in numbers]
     send(sock, {'type': 'accepted', 'ids': ids}, client_lock)
     with lock:
         for task_id, number in zip(ids, numbers):
-            tasks[task_id] = {'number': number, 'delay': delay, 'client': sock,
-                              'client_lock': client_lock, 'attempt': 0, 'worker': None}
+            tasks[task_id] = {
+                'number': number, 'delay': delay, 'client': sock,
+                'client_lock': client_lock, 'attempt': 0, 'worker': None,
+            }
             pending.append(task_id)
         dispatch()
-    # Keep the socket open until every task in this batch has finished.
+
+    # Keep this client's socket open until all its tasks have finished.
     while True:
         time.sleep(0.2)
         with lock:
@@ -177,16 +199,21 @@ def monitor():
         with lock:
             now = time.monotonic()
             for ip, worker in list(workers.items()):
-                overdue = any(now - tasks[t]['started'] > TASK_TIMEOUT
-                              for t in worker['jobs'] if t in tasks)
-                if now - worker['last_seen'] > HEARTBEAT_TIMEOUT or overdue:
-                    remove_worker(ip, worker, 'task timeout' if overdue else 'heartbeat timeout')
+                overdue = any(
+                    now - tasks[task_id]['started'] > TASK_TIMEOUT
+                    for task_id in worker['jobs'] if task_id in tasks
+                )
+                if (now - worker['last_seen'] > HEARTBEAT_TIMEOUT or overdue):
+                    remove_worker(
+                        ip, worker,
+                        'task timeout' if overdue else 'heartbeat timeout',
+                    )
             dispatch()
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--port', type=int, default=5000)
+    parser.add_argument('--port', type=int, default=SERVER_PORT)
     args = parser.parse_args()
     publish_load()
     threading.Thread(target=monitor, daemon=True).start()
@@ -197,7 +224,9 @@ def main():
         print('Task server listening on port', args.port, flush=True)
         while True:
             sock, address = server.accept()
-            threading.Thread(target=handle_connection, args=(sock, address), daemon=True).start()
+            threading.Thread(
+                target=handle_connection, args=(sock, address), daemon=True
+            ).start()
 
 
 if __name__ == '__main__':
