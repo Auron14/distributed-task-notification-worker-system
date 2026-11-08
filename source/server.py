@@ -12,7 +12,7 @@ from common import messages, send
 WORKER_IPS = {'10.0.0.2', '10.0.0.3'}
 LOAD_FILE = '/tmp/sdn_worker_load.json'
 CAPACITY = 2                 # at most 2 outstanding tasks per worker
-TASK_TIMEOUT = 16            # maximum allowed task duration is 5 seconds
+TASK_TIMEOUT = 16            # Allows two sequential 5-second tasks plus overhead
 HEARTBEAT_TIMEOUT = 8
 MAX_ATTEMPTS = 3
 
